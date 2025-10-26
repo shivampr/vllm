@@ -128,6 +128,13 @@ class CacheConfig:
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
 
+    kv_cache_metrics: bool = False
+    """Enable KV cache residency metrics (lifetime, idle time, reuse gaps).
+    Uses sampling to minimize overhead."""
+
+    kv_cache_metrics_sample: float = Field(default=0.01, ge=0, le=1)
+    """Sampling rate for KV cache metrics [0.0, 1.0]. Default 0.01 = 1% of blocks."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
