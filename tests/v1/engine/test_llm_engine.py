@@ -227,10 +227,12 @@ def test_kv_cache_metrics_surface_in_llm_get_metrics(vllm_runner):
         max_model_len=128,
     ) as vllm_model:
         llm: LLM = vllm_model.llm
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=50)
+        sampling_params = SamplingParams(temperature=0.0, max_tokens=30)
 
         # Create a long prompt that will fill multiple complete blocks
-        long_prompt = "Create a long prompt to fill multiple complete blocks. " * 20
+        # Keep prompt length reasonable for max_model_len=128
+        # Block size is typically 16 tokens, so we need prompts that fill blocks
+        long_prompt = "Create a long prompt to fill multiple complete blocks. " * 8
 
         # Generate first request - this will allocate blocks and cache them when full
         outputs1 = llm.generate([long_prompt], sampling_params)
@@ -239,12 +241,13 @@ def test_kv_cache_metrics_surface_in_llm_get_metrics(vllm_runner):
         llm.llm_engine.do_log_stats()
 
         # Generate multiple requests with completely different prefixes
-        # With a small cache, these will force evictions of cached blocks
+        # With a small cache, these should force evictions of cached blocks
         for i in range(8):
             # Each prompt is unique to avoid cache hits
+            # Keep prompt length reasonable for max_model_len=128
             unique_prompt = (
                 f"This is a completely unique prompt number {i} "
-                f"with different content that will not match any previous prompt. " * 20
+                f"with different content that will not match any previous prompt. " * 8
             )
             outputs = llm.generate([unique_prompt], sampling_params)
             assert outputs
@@ -252,7 +255,6 @@ def test_kv_cache_metrics_surface_in_llm_get_metrics(vllm_runner):
             if i % 2 == 0:
                 llm.llm_engine.do_log_stats()
 
-        # Final call to drain any remaining events and record metrics
         llm.llm_engine.do_log_stats()
 
         metrics = llm.get_metrics()
