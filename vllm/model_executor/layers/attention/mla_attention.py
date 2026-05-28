@@ -762,11 +762,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                mqa_q = torch.cat(mqa_q, dim=-1)
-                # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    # Query has already been concatenated and quantized into
+                    # a single tensor by _decode_concat_quant_fp8_op.
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                else:
+                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                    mqa_q = torch.cat(mqa_q, dim=-1)
+                    # mqa_q do allgather in head dim.
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
             if not is_sparse_impl:
