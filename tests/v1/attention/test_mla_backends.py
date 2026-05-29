@@ -580,7 +580,9 @@ class MockMLAAttentionLayer(MLAAttention):
         return output
 
 
-def test_mock_mla_dcp_fp8_decode_gathers_quantized_query(monkeypatch):
+def test_mock_mla_dcp_fp8_decode_gathers_quantized_query(
+    monkeypatch, default_vllm_config
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for FP8 decode query quantization path.")
 
@@ -643,18 +645,19 @@ def test_mock_mla_dcp_fp8_decode_gathers_quantized_query(monkeypatch):
     monkeypatch.setattr(mla_attention_module, "get_dcp_group", lambda: fake_group)
 
     impl = _FakeImpl()
-    layer = MockMLAAttentionLayer(
-        impl=impl,
-        num_heads=num_heads,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        device=device,
-        kv_b_proj=_DummyKVProj(),
-        q_scale=1.0,
-        k_scale=1.0,
-    )
+    with set_current_vllm_config(default_vllm_config):
+        layer = MockMLAAttentionLayer(
+            impl=impl,
+            num_heads=num_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            device=device,
+            kv_b_proj=_DummyKVProj(),
+            q_scale=1.0,
+            k_scale=1.0,
+        )
 
     q = torch.randn(
         num_tokens,
