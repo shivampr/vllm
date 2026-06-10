@@ -2823,6 +2823,7 @@ def cp_gather_and_upconvert_fp8_kv_cache(
     seq_lens: torch.Tensor,
     workspace_starts: torch.Tensor,
     batch_size: int,
+    seq_starts: torch.Tensor | None = None,
 ) -> None:
     """Gather and upconvert FP8 KV cache to BF16 workspace.
 
@@ -2833,9 +2834,16 @@ def cp_gather_and_upconvert_fp8_kv_cache(
         seq_lens: Sequence lengths [num_reqs]
         workspace_starts: Workspace start offsets [num_reqs]
         batch_size: Number of requests
+        seq_starts: Optional starting offsets into each request's cache
     """
     torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
-        src_cache, dst, block_table, seq_lens, workspace_starts, batch_size
+        src_cache,
+        dst,
+        block_table,
+        seq_lens,
+        workspace_starts,
+        batch_size,
+        seq_starts,
     )
 
 

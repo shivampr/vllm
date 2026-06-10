@@ -257,6 +257,56 @@ def test_cp_gather_and_upconvert_fp8_kv_cache(seq_lens, block_size):
     assert torch.equal(dst[:, NOPE_DIM:], expected[:, NOPE_DIM:])
 
 
+def test_cp_gather_and_upconvert_fp8_kv_cache_with_seq_starts():
+    """Gather request suffixes from FP8 cache using per-request start offsets."""
+    full_seq_lens = [13, 11, 9]
+    gather_starts = [3, 5, 0]
+    gather_lens = [7, 4, 6]
+    block_size = 4
+
+    (
+        cache,
+        block_table,
+        _full_seq_lens_t,
+        full_workspace_starts_t,
+        num_reqs,
+        _total_tokens,
+        full_expected,
+    ) = _build_test_case(full_seq_lens, block_size)
+
+    workspace_starts = []
+    expected_chunks = []
+    total = 0
+    for req_id, (start, length) in enumerate(zip(gather_starts, gather_lens)):
+        workspace_starts.append(total)
+        full_start = full_workspace_starts_t[req_id].item() + start
+        expected_chunks.append(full_expected[full_start : full_start + length])
+        total += length
+
+    dst = torch.zeros(total, NOPE_DIM + ROPE_DIM, dtype=torch.bfloat16, device="cuda")
+    seq_lens_t = torch.tensor(gather_lens, dtype=torch.int32, device="cuda")
+    workspace_starts_t = torch.tensor(
+        workspace_starts, dtype=torch.int32, device="cuda"
+    )
+    seq_starts_t = torch.tensor(gather_starts, dtype=torch.int32, device="cuda")
+
+    ops.cp_gather_and_upconvert_fp8_kv_cache(
+        cache,
+        dst,
+        block_table,
+        seq_lens_t,
+        workspace_starts_t,
+        num_reqs,
+        seq_starts_t,
+    )
+
+    expected = torch.cat(expected_chunks)
+    torch.testing.assert_close(
+        dst[:, :NOPE_DIM], expected[:, :NOPE_DIM], atol=1e-3, rtol=1e-2
+    )
+    assert torch.equal(dst[:, NOPE_DIM:], expected[:, NOPE_DIM:])
+
+
 def test_cp_gather_fp8_shuffled_blocks():
     """Test that the kernel correctly follows the block table when
     physical blocks are non-contiguous and out of order.
