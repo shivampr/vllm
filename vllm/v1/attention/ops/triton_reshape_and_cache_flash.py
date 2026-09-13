@@ -466,29 +466,24 @@ def _fused_rope(
     positions_ptr,
     cos_sin_cache_ptr,
     cos_sin_stride,
+    pair_block,
     head_size: tl.constexpr,
     rotary_dim: tl.constexpr,
     is_neox: tl.constexpr,
     tile_size: tl.constexpr,
 ):
-    dim = tl.arange(0, tile_size)
-    mask = dim < head_size
-    offsets = token * token_stride + head * head_stride + dim
-    x = tl.load(ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    pair = pair_block * tile_size + tl.arange(0, tile_size)
     half_rotary_dim = rotary_dim // 2
+    mask = pair < half_rotary_dim
     if is_neox:
-        pair = dim % half_rotary_dim
-        partner_dim = tl.where(
-            dim < half_rotary_dim, dim + half_rotary_dim, dim - half_rotary_dim
-        )
+        x_dim = pair
+        y_dim = pair + half_rotary_dim
     else:
-        pair = dim // 2
-        partner_dim = tl.where(dim % 2 == 0, dim + 1, dim - 1)
-    partner = tl.load(
-        ptr + token * token_stride + head * head_stride + partner_dim,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
+        x_dim = 2 * pair
+        y_dim = x_dim + 1
+    base = token * token_stride + head * head_stride
+    x = tl.load(ptr + base + x_dim, mask=mask, other=0.0).to(tl.float32)
+    y = tl.load(ptr + base + y_dim, mask=mask, other=0.0).to(tl.float32)
     cos_base = tl.load(positions_ptr + token).to(tl.int64) * cos_sin_stride
     cos = tl.load(cos_sin_cache_ptr + cos_base + pair, mask=mask, other=1.0).to(
         tl.float32
@@ -498,14 +493,11 @@ def _fused_rope(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    first = dim < half_rotary_dim if is_neox else dim % 2 == 0
-    rotated = tl.where(
-        dim < rotary_dim,
-        tl.where(first, x * cos - partner * sin, partner * cos + x * sin),
-        x,
-    )
-    tl.store(ptr + offsets, rotated, mask=mask)
-    return rotated
+    x_rotated = x * cos - y * sin
+    y_rotated = y * cos + x * sin
+    tl.store(ptr + base + x_dim, x_rotated, mask=mask)
+    tl.store(ptr + base + y_dim, y_rotated, mask=mask)
+    return x_rotated, y_rotated
 
 
 @triton.jit
@@ -542,11 +534,19 @@ def fused_rope_and_cache_kernel(
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
-    dim = tl.arange(0, tile_size)
-    mask = dim < head_size
+    pair_block = tl.program_id(2)
+    pair = pair_block * tile_size + tl.arange(0, tile_size)
+    mask = pair < rotary_dim // 2
+    half_rotary_dim = rotary_dim // 2
+    if is_neox:
+        x_dim = pair
+        y_dim = pair + half_rotary_dim
+    else:
+        x_dim = 2 * pair
+        y_dim = x_dim + 1
 
     if head < num_query_heads:
-        _fused_rope(
+        _q_x, _q_y = _fused_rope(
             query_ptr,
             token,
             head,
@@ -555,6 +555,7 @@ def fused_rope_and_cache_kernel(
             positions_ptr,
             cos_sin_cache_ptr,
             cos_sin_stride,
+            pair_block,
             head_size=head_size,
             rotary_dim=rotary_dim,
             is_neox=is_neox,
@@ -562,7 +563,7 @@ def fused_rope_and_cache_kernel(
         )
 
     if head < num_kv_heads:
-        rotated_key = _fused_rope(
+        rotated_key_x, rotated_key_y = _fused_rope(
             key_ptr,
             token,
             head,
@@ -571,16 +572,15 @@ def fused_rope_and_cache_kernel(
             positions_ptr,
             cos_sin_cache_ptr,
             cos_sin_stride,
+            pair_block,
             head_size=head_size,
             rotary_dim=rotary_dim,
             is_neox=is_neox,
             tile_size=tile_size,
         )
-        value = tl.load(
-            value_ptr + token * value_token_stride + head * value_head_stride + dim,
-            mask=mask,
-            other=0.0,
-        )
+        value_base = token * value_token_stride + head * value_head_stride
+        value_x = tl.load(value_ptr + value_base + x_dim, mask=mask, other=0.0)
+        value_y = tl.load(value_ptr + value_base + y_dim, mask=mask, other=0.0)
         slot = tl.load(slot_mapping_ptr + token).to(tl.int64)
         valid_slot = slot >= 0
         block = slot // block_size
@@ -589,13 +589,32 @@ def fused_rope_and_cache_kernel(
             block * cache_block_stride
             + block_offset * cache_slot_stride
             + head * cache_head_stride
-            + dim * cache_dim_stride
         )
         if fp8_kv_cache:
-            rotated_key = rotated_key / tl.load(k_scale).to(tl.float32)
-            value = value / tl.load(v_scale).to(tl.float32)
-        tl.store(key_cache_ptr + cache_offset, rotated_key, mask=mask & valid_slot)
-        tl.store(value_cache_ptr + cache_offset, value, mask=mask & valid_slot)
+            rotated_key_x = rotated_key_x / tl.load(k_scale).to(tl.float32)
+            rotated_key_y = rotated_key_y / tl.load(k_scale).to(tl.float32)
+            value_x = value_x / tl.load(v_scale).to(tl.float32)
+            value_y = value_y / tl.load(v_scale).to(tl.float32)
+        tl.store(
+            key_cache_ptr + cache_offset + x_dim * cache_dim_stride,
+            rotated_key_x,
+            mask=mask & valid_slot,
+        )
+        tl.store(
+            key_cache_ptr + cache_offset + y_dim * cache_dim_stride,
+            rotated_key_y,
+            mask=mask & valid_slot,
+        )
+        tl.store(
+            value_cache_ptr + cache_offset + x_dim * cache_dim_stride,
+            value_x,
+            mask=mask & valid_slot,
+        )
+        tl.store(
+            value_cache_ptr + cache_offset + y_dim * cache_dim_stride,
+            value_y,
+            mask=mask & valid_slot,
+        )
 
 
 def triton_fused_rope_and_cache(
@@ -618,8 +637,12 @@ def triton_fused_rope_and_cache(
     num_kv_heads = key.shape[1]
     rotary_dim = cos_sin_cache.shape[-1]
     assert rotary_dim == head_size and rotary_dim % 2 == 0
-    tile_size = min(256, triton.next_power_of_2(head_size))
-    grid = (num_tokens, max(num_query_heads, num_kv_heads))
+    tile_size = min(128, triton.next_power_of_2(rotary_dim // 2))
+    grid = (
+        num_tokens,
+        max(num_query_heads, num_kv_heads),
+        triton.cdiv(rotary_dim // 2, tile_size),
+    )
     fused_rope_and_cache_kernel[grid](
         query,
         key,
