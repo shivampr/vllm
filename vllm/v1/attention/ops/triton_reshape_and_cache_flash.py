@@ -399,6 +399,7 @@ def triton_reshape_and_cache_flash(
         f"on this device: an FP8 KV cache needs native fp8e4nv (SM89+). Use "
         f"--kv-cache-dtype bfloat16 (or float16 on SM75)."
     )
+
     kv_cache_torch_dtype = (
         current_platform.fp8_dtype()
         if is_quantized_kv_cache(kv_cache_dtype)
@@ -408,8 +409,7 @@ def triton_reshape_and_cache_flash(
     if key_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
         kv_cache_dtype
     ):
-        # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
-        # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
+        # to avoid erroneous implicit cast in triton kernel (tl.store to uint8)
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
@@ -424,8 +424,6 @@ def triton_reshape_and_cache_flash(
         if torch.cuda.get_device_capability(key.device)[0] < 9:
             TILE_SIZE = min(512, TILE_SIZE)
 
-    # TODO(ngl): maybe replace with static launch grid to avoid overhead if
-    #   using cudagraphs
     grid = lambda meta: (
         slot_mapping.shape[0],
         triton.cdiv(n, meta["TILE_SIZE"]),
@@ -439,7 +437,6 @@ def triton_reshape_and_cache_flash(
         slot_mapping_ptr=slot_mapping,
         k_scale=k_scale,
         v_scale=v_scale,
-        # strides
         key_stride=key_stride,
         value_stride=value_stride,
         block_stride=block_stride,
@@ -453,10 +450,203 @@ def triton_reshape_and_cache_flash(
         x=x,
         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
         FP8_KV_CACHE=FP8_KV_CACHE,
-        # autotune parameters
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,
         num_stages=num_stages,
+    )
+
+
+@triton.jit
+def _fused_rope(
+    ptr,
+    token,
+    head,
+    token_stride,
+    head_stride,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    head_size: tl.constexpr,
+    rotary_dim: tl.constexpr,
+    is_neox: tl.constexpr,
+    tile_size: tl.constexpr,
+):
+    dim = tl.arange(0, tile_size)
+    mask = dim < head_size
+    offsets = token * token_stride + head * head_stride + dim
+    x = tl.load(ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    half_rotary_dim = rotary_dim // 2
+    if is_neox:
+        pair = dim % half_rotary_dim
+        partner_dim = tl.where(
+            dim < half_rotary_dim, dim + half_rotary_dim, dim - half_rotary_dim
+        )
+    else:
+        pair = dim // 2
+        partner_dim = tl.where(dim % 2 == 0, dim + 1, dim - 1)
+    partner = tl.load(
+        ptr + token * token_stride + head * head_stride + partner_dim,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    cos_base = tl.load(positions_ptr + token).to(tl.int64) * cos_sin_stride
+    cos = tl.load(cos_sin_cache_ptr + cos_base + pair, mask=mask, other=1.0).to(
+        tl.float32
+    )
+    sin = tl.load(
+        cos_sin_cache_ptr + cos_base + half_rotary_dim + pair,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    rotated = tl.where(dim < rotary_dim, x * cos - partner * sin, x)
+    rotated = tl.where(dim < rotary_dim, partner * cos + x * sin, rotated)
+    tl.store(ptr + offsets, rotated, mask=mask)
+    return rotated
+
+
+@triton.jit
+def fused_rope_and_cache_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    k_scale,
+    v_scale,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    slot_mapping_ptr,
+    query_token_stride: tl.int64,
+    query_head_stride: tl.int64,
+    key_token_stride: tl.int64,
+    key_head_stride: tl.int64,
+    value_token_stride: tl.int64,
+    value_head_stride: tl.int64,
+    cache_block_stride: tl.int64,
+    cache_slot_stride: tl.int64,
+    cache_head_stride: tl.int64,
+    cache_dim_stride: tl.int64,
+    cos_sin_stride: tl.int64,
+    num_query_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_size: tl.constexpr,
+    rotary_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    is_neox: tl.constexpr,
+    fp8_kv_cache: tl.constexpr,
+    tile_size: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    dim = tl.arange(0, tile_size)
+    mask = dim < head_size
+
+    if head < num_query_heads:
+        _fused_rope(
+            query_ptr,
+            token,
+            head,
+            query_token_stride,
+            query_head_stride,
+            positions_ptr,
+            cos_sin_cache_ptr,
+            cos_sin_stride,
+            head_size,
+            rotary_dim,
+            is_neox,
+            tile_size,
+        )
+
+    if head < num_kv_heads:
+        rotated_key = _fused_rope(
+            key_ptr,
+            token,
+            head,
+            key_token_stride,
+            key_head_stride,
+            positions_ptr,
+            cos_sin_cache_ptr,
+            cos_sin_stride,
+            head_size,
+            rotary_dim,
+            is_neox,
+            tile_size,
+        )
+        value = tl.load(
+            value_ptr + token * value_token_stride + head * value_head_stride + dim,
+            mask=mask,
+            other=0.0,
+        )
+        slot = tl.load(slot_mapping_ptr + token).to(tl.int64)
+        valid_slot = slot >= 0
+        block = slot // block_size
+        block_offset = slot % block_size
+        cache_offset = (
+            block * cache_block_stride
+            + block_offset * cache_slot_stride
+            + head * cache_head_stride
+            + dim * cache_dim_stride
+        )
+        if fp8_kv_cache:
+            rotated_key = rotated_key / tl.load(k_scale).to(tl.float32)
+            value = value / tl.load(v_scale).to(tl.float32)
+        tl.store(key_cache_ptr + cache_offset, rotated_key, mask=mask & valid_slot)
+        tl.store(value_cache_ptr + cache_offset, value, mask=mask & valid_slot)
+
+
+def triton_fused_rope_and_cache(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    kv_cache_dtype: str,
+) -> None:
+    """Apply RoPE and update an NHD paged KV cache in one CUDA kernel."""
+    assert key_cache.ndim == 4 and value_cache.ndim == 4
+    num_tokens, num_query_heads, head_size = query.shape
+    num_kv_heads = key.shape[1]
+    rotary_dim = cos_sin_cache.shape[-1]
+    assert rotary_dim == head_size and rotary_dim % 2 == 0
+    tile_size = min(256, triton.next_power_of_2(head_size))
+    grid = (num_tokens, max(num_query_heads, num_kv_heads))
+    fused_rope_and_cache_kernel[grid](
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        k_scale,
+        v_scale,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        query.stride(0),
+        query.stride(1),
+        key.stride(0),
+        key.stride(1),
+        value.stride(0),
+        value.stride(1),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        cos_sin_cache.stride(0),
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        rotary_dim=rotary_dim,
+        block_size=key_cache.shape[1],
+        is_neox=is_neox,
+        fp8_kv_cache=is_quantized_kv_cache(kv_cache_dtype),
+        tile_size=tile_size,
+        num_warps=4,
     )
 
 
