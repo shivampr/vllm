@@ -49,9 +49,7 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
-# Diagnostic switch: keep the native CUDA path enabled until the fused kernel
-# passes the standalone correctness test.
-CUDA_FUSED_ROPE_KVCACHE_ENABLED = False
+CUDA_FUSED_ROPE_KVCACHE_ENABLED = True
 
 
 # constants
