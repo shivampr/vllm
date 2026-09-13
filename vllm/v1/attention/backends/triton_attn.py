@@ -49,6 +49,10 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+# Diagnostic switch: keep the native CUDA path enabled until the fused kernel
+# passes the standalone correctness test.
+CUDA_FUSED_ROPE_KVCACHE_ENABLED = False
+
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
@@ -825,7 +829,11 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
 
-        if current_platform.is_cuda() and key_cache.ndim == 4:
+        if (
+            CUDA_FUSED_ROPE_KVCACHE_ENABLED
+            and current_platform.is_cuda()
+            and key_cache.ndim == 4
+        ):
             triton_fused_rope_and_cache(
                 query,
                 key,
