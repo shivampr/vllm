@@ -555,10 +555,10 @@ def fused_rope_and_cache_kernel(
             positions_ptr,
             cos_sin_cache_ptr,
             cos_sin_stride,
-            head_size,
-            rotary_dim,
-            is_neox,
-            tile_size,
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            is_neox=is_neox,
+            tile_size=tile_size,
         )
 
     if head < num_kv_heads:
@@ -571,10 +571,10 @@ def fused_rope_and_cache_kernel(
             positions_ptr,
             cos_sin_cache_ptr,
             cos_sin_stride,
-            head_size,
-            rotary_dim,
-            is_neox,
-            tile_size,
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            is_neox=is_neox,
+            tile_size=tile_size,
         )
         value = tl.load(
             value_ptr + token * value_token_stride + head * value_head_stride + dim,
