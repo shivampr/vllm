@@ -498,8 +498,12 @@ def _fused_rope(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    rotated = tl.where(dim < rotary_dim, x * cos - partner * sin, x)
-    rotated = tl.where(dim < rotary_dim, partner * cos + x * sin, rotated)
+    first = dim < half_rotary_dim if is_neox else dim % 2 == 0
+    rotated = tl.where(
+        dim < rotary_dim,
+        tl.where(first, x * cos - partner * sin, partner * cos + x * sin),
+        x,
+    )
     tl.store(ptr + offsets, rotated, mask=mask)
     return rotated
 
